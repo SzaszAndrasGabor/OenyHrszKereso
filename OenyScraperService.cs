@@ -32,6 +32,7 @@ public class OenyScraperService : IAsyncDisposable
         {
             Headless = _config.Headless,
             SlowMo = _config.SlowMo,
+            ExecutablePath = FindChrome()
         });
 
         var context = await _browser.NewContextAsync(new BrowserNewContextOptions
@@ -114,6 +115,78 @@ public class OenyScraperService : IAsyncDisposable
         catch { }
     }
 
+    /// <summary>
+    /// Autocomplete mezőbe ír és megkeresi a pontosan egyező elemet a dropdownban.
+    /// Chrome-ban az Angular overlay a body-ba rendereli a dropdownt,
+    /// ezért több szelektort próbálunk.
+    /// </summary>
+    private async Task<bool> AutocompleteKivalasztAsync(ILocator input, string ertek, string mezoNev)
+    {
+        await input.ClickAsync();
+        await input.FillAsync(ertek);
+        await _page!.WaitForTimeoutAsync(1500);
+
+        // Chrome-ban az Angular overlay a body-ba rendereli a dropdownt
+        var dropdownSzelektorok = new[]
+        {
+            "li.p-autocomplete-item",
+            ".p-autocomplete-panel li",
+            ".p-overlay li",
+            "ul.p-autocomplete-items li",
+            "[class*='autocomplete'] li",
+        };
+
+        IReadOnlyList<IElementHandle>? options = null;
+        foreach (var szelektor in dropdownSzelektorok)
+        {
+            var found = await _page.QuerySelectorAllAsync(szelektor);
+            if (found.Count > 0)
+            {
+                _logger.LogInformation("{Mezo}: dropdown ({Szelektor}), {Db} elem",
+                    mezoNev, szelektor, found.Count);
+                options = found;
+                break;
+            }
+        }
+
+        if (options == null || options.Count == 0)
+        {
+            // Utolsó esély: várunk még 2mp és újra próbálunk
+            await _page.WaitForTimeoutAsync(2000);
+            options = await _page.QuerySelectorAllAsync("li.p-autocomplete-item");
+            if (options.Count == 0)
+            {
+                _logger.LogWarning("{Mezo}: dropdown nem jelent meg '{Ertek}' beírása után.", mezoNev, ertek);
+                return false;
+            }
+        }
+
+        // Pontos egyezés keresése
+        foreach (var option in options)
+        {
+            var text = (await option.InnerTextAsync()).Trim();
+            _logger.LogInformation("DROPDOWN ELEM: '{Text}'", text);
+            if (string.Equals(text, ertek, StringComparison.OrdinalIgnoreCase))
+            {
+                await option.EvaluateAsync("el => el.click()");
+                _logger.LogInformation("{Mezo}: kiválasztva: '{Ertek}'", mezoNev, ertek);
+                await _page.WaitForTimeoutAsync(300);
+                return true;
+            }
+        }
+
+        // Nincs pontos egyezés
+        var lehetosegek = new List<string>();
+        foreach (var o in options)
+            lehetosegek.Add((await o.InnerTextAsync()).Trim());
+        _logger.LogWarning("{Mezo}: nincs pontos egyezés '{Ertek}'. Opciók: {Opciok}",
+            mezoNev, ertek, string.Join(", ", lehetosegek));
+
+        await input.PressAsync("Escape");
+        await _page.WaitForTimeoutAsync(300);
+        return false;
+    }
+
     public async Task<List<SearchResult>> SearchAsync(InputRow input)
     {
         bool hrszMod = !string.IsNullOrWhiteSpace(input.Hrsz);
@@ -134,31 +207,27 @@ public class OenyScraperService : IAsyncDisposable
                 Timeout = _config.NavigationTimeoutMs
             });
 
-            // ── 1. LÉPÉS: Település mező ──────────────────────────────────────────
+            // ── 1. LÉPÉS: Település mező — pontos egyezés ────────────────────────
             var settlementInput = _page.Locator("input.p-autocomplete-input").Nth(0);
             await settlementInput.WaitForAsync(new LocatorWaitForOptions
             {
                 State = WaitForSelectorState.Visible,
                 Timeout = _config.ElementTimeoutMs
             });
-            await settlementInput.ClickAsync();
-            await settlementInput.FillAsync(input.Varos);
-            await _page.WaitForTimeoutAsync(1000);
 
-            await settlementInput.PressAsync("ArrowDown");
-            await _page.WaitForTimeoutAsync(300);
-            await settlementInput.PressAsync("Enter");
-            await _page.WaitForTimeoutAsync(800);
-
-            try
+            bool varosOk = await AutocompleteKivalasztAsync(settlementInput, input.Varos, "Település");
+            if (!varosOk)
             {
-                if (await _page.Locator("li.p-autocomplete-item").First.IsVisibleAsync())
+                return new List<SearchResult> { new SearchResult
                 {
-                    await _page.Locator("li.p-autocomplete-item").First.EvaluateAsync("el => el.click()");
-                    await _page.WaitForTimeoutAsync(800);
-                }
+                    Varos       = input.Varos,
+                    InputHrsz   = input.Hrsz,
+                    InputCim    = input.Cim,
+                    KeresesiMod = hrszMod ? "HRSZ" : "Cím",
+                    Sikeres     = false,
+                    Hiba        = $"Település nem található pontosan: {input.Varos}"
+                }};
             }
-            catch { }
 
             _logger.LogInformation("Település kiválasztva: {Varos}", input.Varos);
 
@@ -182,7 +251,7 @@ public class OenyScraperService : IAsyncDisposable
     // ── HRSZ alapú keresés ────────────────────────────────────────────────────
     private async Task<List<SearchResult>> SearchByHrszAsync(InputRow input)
     {
-        await _page!.WaitForTimeoutAsync(800);
+        await _page!.WaitForTimeoutAsync(400);
         var hrszTab = _page.Locator(
             "label:has-text('Helyrajzi'), button:has-text('Helyrajzi'), " +
             ".p-button:has-text('Helyrajzi'), [role='tab']:has-text('Helyrajzi'), " +
@@ -195,7 +264,7 @@ public class OenyScraperService : IAsyncDisposable
         });
         await hrszTab.ClickAsync();
         _logger.LogInformation("'Helyrajzi szám' mód kiválasztva.");
-        await _page.WaitForTimeoutAsync(500);
+        await _page.WaitForTimeoutAsync(200);
 
         var hrszInput = _page.Locator("input.p-autocomplete-input").Nth(1);
         await hrszInput.WaitForAsync(new LocatorWaitForOptions
@@ -203,24 +272,19 @@ public class OenyScraperService : IAsyncDisposable
             State = WaitForSelectorState.Visible,
             Timeout = _config.ElementTimeoutMs
         });
-        await hrszInput.ClickAsync();
-        await hrszInput.FillAsync(input.Hrsz);
-        await _page.WaitForTimeoutAsync(1000);
 
-        await hrszInput.PressAsync("ArrowDown");
-        await _page.WaitForTimeoutAsync(300);
-        await hrszInput.PressAsync("Enter");
-        await _page.WaitForTimeoutAsync(800);
-
-        try
+        bool hrszOk = await AutocompleteKivalasztAsync(hrszInput, input.Hrsz, "HRSZ");
+        if (!hrszOk)
         {
-            if (await _page.Locator("li.p-autocomplete-item").First.IsVisibleAsync())
+            return new List<SearchResult> { new SearchResult
             {
-                await _page.Locator("li.p-autocomplete-item").First.EvaluateAsync("el => el.click()");
-                await _page.WaitForTimeoutAsync(800);
-            }
+                Varos       = input.Varos,
+                InputHrsz   = input.Hrsz,
+                KeresesiMod = "HRSZ",
+                Sikeres     = false,
+                Hiba        = $"HRSZ nem található pontosan: {input.Hrsz}"
+            }};
         }
-        catch { }
 
         _logger.LogInformation("HRSZ kiválasztva: {Hrsz}", input.Hrsz);
         await WaitForApiResponseAsync("bounding-box");
@@ -241,7 +305,7 @@ public class OenyScraperService : IAsyncDisposable
             if (await cimTab.IsVisibleAsync())
             {
                 await cimTab.ClickAsync();
-                await _page.WaitForTimeoutAsync(500);
+                await _page.WaitForTimeoutAsync(100);
             }
         }
         catch { }
@@ -269,24 +333,18 @@ public class OenyScraperService : IAsyncDisposable
             });
         }
 
-        await cimInput.ClickAsync();
-        await cimInput.FillAsync(input.Cim);
-        await _page.WaitForTimeoutAsync(1200);
-
-        await cimInput.PressAsync("ArrowDown");
-        await _page.WaitForTimeoutAsync(300);
-        await cimInput.PressAsync("Enter");
-        await _page.WaitForTimeoutAsync(800);
-
-        try
+        bool cimOk = await AutocompleteKivalasztAsync(cimInput, input.Cim, "Cím");
+        if (!cimOk)
         {
-            if (await _page.Locator("li.p-autocomplete-item").First.IsVisibleAsync())
+            return new List<SearchResult> { new SearchResult
             {
-                await _page.Locator("li.p-autocomplete-item").First.EvaluateAsync("el => el.click()");
-                await _page.WaitForTimeoutAsync(800);
-            }
+                Varos       = input.Varos,
+                InputCim    = input.Cim,
+                KeresesiMod = "Cím",
+                Sikeres     = false,
+                Hiba        = $"Cím nem található pontosan: {input.Cim}"
+            }};
         }
-        catch { }
 
         _logger.LogInformation("Cím kiválasztva: {Cim}", input.Cim);
         await WaitForApiResponseAsync("addresses/position");
@@ -299,14 +357,14 @@ public class OenyScraperService : IAsyncDisposable
         {
             await _page!.WaitForResponseAsync(
                 r => r.Url.Contains(urlPart),
-                new PageWaitForResponseOptions { Timeout = 5000 });
+                new PageWaitForResponseOptions { Timeout = 3000 });
             await _page.WaitForTimeoutAsync(300);
             _logger.LogInformation("API válasz megérkezett: {UrlPart}", urlPart);
         }
         catch
         {
             _logger.LogWarning("API válasz nem érkezett: {UrlPart}", urlPart);
-            await _page!.WaitForTimeoutAsync(2000);
+            await _page!.WaitForTimeoutAsync(100);
         }
     }
 
@@ -318,7 +376,7 @@ public class OenyScraperService : IAsyncDisposable
         bool urlOk = currentUrl != BaseUrl && currentUrl.Contains("state=");
 
         // Megvárjuk hogy Angular renderje a tulajdoni lap linkeket
-        await _page.WaitForTimeoutAsync(800);
+        await _page.WaitForTimeoutAsync(500);
 
         var cards = await _page.QuerySelectorAllAsync("div.result-card");
 
@@ -390,47 +448,17 @@ public class OenyScraperService : IAsyncDisposable
                 }
 
                 // ── Tulajdoni lap link ────────────────────────────────────────────
-                // Az Angular komponens (app-property-sheet-navigation-link) lazy renderel,
-                // ezért JS-sel olvassuk ki a már renderelt href-et.
-                // A HTML-ből: <a class="property-sheet-navigation-link" href="https://magyarorszag.hu/eing_new?...">
-                //string? tulajdoniLapLink = await card.EvaluateAsync<string?>(
-                //    "el => { const a = el.querySelector('a.property-sheet-navigation-link'); return a ? a.href : null; }");
-                // ── Tulajdoni lap link ────────────────────────────────────────────────────────
-                // Megvárjuk hogy Angular renderje az a.property-sheet-navigation-link elemet
                 string? tulajdoniLapLink = null;
                 try
                 {
-                    await _page!.WaitForSelectorAsync(
+                    await _page.WaitForSelectorAsync(
                         "a.property-sheet-navigation-link",
                         new PageWaitForSelectorOptions { Timeout = 3000 });
 
                     tulajdoniLapLink = await card.EvaluateAsync<string?>(
                         "el => { const a = el.querySelector('a.property-sheet-navigation-link'); return a ? a.href : null; }");
-                    // ── Tulajdoni lap link ────────────────────────────────────────────────────────
-
                 }
-                //string? tulajdoniLapLink = null;
-                //    try
-                //    {
-                //        await _page!.WaitForSelectorAsync(
-                //            "a.property-sheet-navigation-link",
-                //            new PageWaitForSelectorOptions { Timeout = 3000 });
-
-                //        tulajdoniLapLink = await card.EvaluateAsync<string?>(
-                //            "el => { const a = el.querySelector('a.property-sheet-navigation-link'); return a ? a.href : null; }");
-
-                //        // ← IDE SZÚRD BE:
-                //        _logger.LogInformation("Tulajdoni lap JS eredmény: '{Link}'", tulajdoniLapLink ?? "(null)");
-                //    }
-                //    catch (Exception ex)
-                //    {
-                //        _logger.LogWarning("Tulajdoni lap kinyerési hiba: {Msg}", ex.Message);
-                //    }
                 catch { }
-
-
-
-                _logger.LogDebug("Tulajdoni lap link: {Link}", tulajdoniLapLink ?? "(üres)");
 
                 results.Add(new SearchResult
                 {
@@ -471,6 +499,18 @@ public class OenyScraperService : IAsyncDisposable
         Hiba = hiba
     };
 
+    private static string? FindChrome()
+    {
+        var candidates = new[]
+        {
+            @"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                @"Google\Chrome\Application\chrome.exe"),
+        };
+        return candidates.FirstOrDefault(File.Exists);
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_browser is not null)
@@ -482,8 +522,8 @@ public class OenyScraperService : IAsyncDisposable
 public record ScraperConfig
 {
     public bool Headless { get; init; } = true;
-    public int SlowMo { get; init; } = 50;
-    public int DelayBetweenSearchesMs { get; init; } = 1500;
+    public int SlowMo { get; init; } = 80;
+    public int DelayBetweenSearchesMs { get; init; } = 1000;
     public int NavigationTimeoutMs { get; init; } = 30_000;
     public int ElementTimeoutMs { get; init; } = 10_000;
 }

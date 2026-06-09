@@ -20,12 +20,33 @@ var inputDir = Path.GetDirectoryName(inputFile) ?? ".";
 var inputName = Path.GetFileNameWithoutExtension(inputFile);
 var outputFile = Path.Combine(inputDir, $"{inputName}_eredmenyek.xlsx");
 
+// ── Playwright telepítő mód: OenyHrszKereso.exe install chromium ─────────────
+if (args.Length > 0 && args[0] == "install")
+{
+    var exitCode = Microsoft.Playwright.Program.Main(args);
+    return exitCode;
+}
+
+// ── Chrome ellenőrzés ─────────────────────────────────────────────────────────
+var chromePaths = new[]
+{
+    @"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        @"Google\Chrome\Application\chrome.exe"),
+};
+var chromeExe = chromePaths.FirstOrDefault(File.Exists);
+if (chromeExe != null)
+    Console.WriteLine($"Chrome megtalálva: {chromeExe}");
+else
+    Console.WriteLine("Chrome nem található — beépített Chromium lesz használva. Futtasd egyszer: OenyHrszKereso.exe install chromium");
+
 // ── Konfiguráció ──────────────────────────────────────────────────────────────
 var config = new ScraperConfig
 {
     Headless = false,
     SlowMo = 50,
-    DelayBetweenSearchesMs = 1500,
+    DelayBetweenSearchesMs = 1000,
     NavigationTimeoutMs = 30_000,
     ElementTimeoutMs = 10_000,
 };
