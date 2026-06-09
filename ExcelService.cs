@@ -17,7 +17,12 @@ public class ExcelService
     /// Oszlopok: Varos | HRSZ (opcionális) | Cim (opcionális)
     /// Ha HRSZ üres → cím szerinti keresés
     /// </summary>
-    public List<InputRow> ReadInput(string filePath)
+    /// <summary>
+    /// Beolvassa a bemeneti Excel fájlt.
+    /// Az oszlop indexek 1-alapúak (1=A, 2=B, ...), 0 = nincs megadva.
+    /// </summary>
+    public List<InputRow> ReadInput(string filePath,
+        int varosOszlop = 1, int hrszOszlop = 2, int cimOszlop = 3)
     {
         if (!File.Exists(filePath))
             throw new FileNotFoundException($"A bemeneti fájl nem található: {filePath}");
@@ -26,32 +31,16 @@ public class ExcelService
         using var workbook = new XLWorkbook(filePath);
         var sheet = workbook.Worksheets.First();
 
-        var headerRow = sheet.Row(1);
-        int varosCol = -1, hrszCol = -1, cimCol = -1;
-
-        foreach (var cell in headerRow.CellsUsed())
-        {
-            var header = cell.GetString().Trim().ToLower();
-            if (header is "varos" or "város" or "település" or "telepules")
-                varosCol = cell.Address.ColumnNumber;
-            else if (header is "hrsz" or "helyrajzi szám" or "helyrajzi szam")
-                hrszCol = cell.Address.ColumnNumber;
-            else if (header is "cim" or "cím" or "utca" or "address")
-                cimCol = cell.Address.ColumnNumber;
-        }
-
-        if (varosCol == -1)
-            throw new InvalidOperationException(
-                "Nem található a 'Varos' oszlop. " +
-                "Ellenőrizd, hogy az első sor tartalmazza a fejléceket.");
-
         int lastRow = sheet.LastRowUsed()?.RowNumber() ?? 1;
-        for (int r = 2; r <= lastRow; r++)
+
+        // Az első sort is feldolgozzuk (nincs fejléc sor kihagyás —
+        // a felhasználó maga dönt az oszlopokról)
+        for (int r = 1; r <= lastRow; r++)
         {
-            var row = sheet.Row(r);
-            var varos = varosCol > 0 ? row.Cell(varosCol).GetString().Trim() : "";
-            var hrsz = hrszCol > 0 ? row.Cell(hrszCol).GetString().Trim() : "";
-            var cim = cimCol > 0 ? row.Cell(cimCol).GetString().Trim() : "";
+            var row   = sheet.Row(r);
+            var varos = varosOszlop > 0 ? row.Cell(varosOszlop).GetString().Trim() : "";
+            var hrsz  = hrszOszlop  > 0 ? row.Cell(hrszOszlop).GetString().Trim()  : "";
+            var cim   = cimOszlop   > 0 ? row.Cell(cimOszlop).GetString().Trim()   : "";
 
             if (string.IsNullOrWhiteSpace(varos))
             {
@@ -69,7 +58,7 @@ public class ExcelService
         }
 
         int hrszDb = rows.Count(r => !string.IsNullOrWhiteSpace(r.Hrsz));
-        int cimDb = rows.Count(r => string.IsNullOrWhiteSpace(r.Hrsz));
+        int cimDb  = rows.Count(r =>  string.IsNullOrWhiteSpace(r.Hrsz));
         _logger.LogInformation("{Total} bemeneti sor beolvasva ({Hrsz} HRSZ, {Cim} cím alapú).",
             rows.Count, hrszDb, cimDb);
 
@@ -108,16 +97,16 @@ public class ExcelService
 
         foreach (var r in results)
         {
-            var inputKey = $"{r.Varos}|{r.InputHrsz}|{r.InputCim}";
-            bool altGroup = inputKey != prevInputKey && prevInputKey != null;
-            prevInputKey = inputKey;
+            var inputKey      = $"{r.Varos}|{r.InputHrsz}|{r.InputCim}";
+            bool altGroup     = inputKey != prevInputKey && prevInputKey != null;
+            prevInputKey      = inputKey;
 
-            sheet.Cell(rowNum, 1).Value = r.Varos;
-            sheet.Cell(rowNum, 2).Value = r.InputHrsz;
-            sheet.Cell(rowNum, 3).Value = r.InputCim;
-            sheet.Cell(rowNum, 4).Value = r.KeresesiMod;
-            sheet.Cell(rowNum, 5).Value = r.Cim ?? "";
-            sheet.Cell(rowNum, 6).Value = r.TalalaltHrsz ?? "";
+            sheet.Cell(rowNum, 1).Value  = r.Varos;
+            sheet.Cell(rowNum, 2).Value  = r.InputHrsz;
+            sheet.Cell(rowNum, 3).Value  = r.InputCim;
+            sheet.Cell(rowNum, 4).Value  = r.KeresesiMod;
+            sheet.Cell(rowNum, 5).Value  = r.Cim ?? "";
+            sheet.Cell(rowNum, 6).Value  = r.TalalaltHrsz ?? "";
 
             // Térkép link (7. oszlop)
             if (!string.IsNullOrEmpty(r.TerkeLink))
@@ -129,8 +118,8 @@ public class ExcelService
                 linkCell.Style.Font.Underline = XLFontUnderlineValues.Single;
             }
 
-            sheet.Cell(rowNum, 8).Value = r.EovX ?? "";
-            sheet.Cell(rowNum, 9).Value = r.EovY ?? "";
+            sheet.Cell(rowNum, 8).Value  = r.EovX ?? "";
+            sheet.Cell(rowNum, 9).Value  = r.EovY ?? "";
 
             if (r.Albetek.HasValue)
                 sheet.Cell(rowNum, 10).Value = r.Albetek.Value;
