@@ -2,43 +2,53 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using OenyHrszKereso;
 
-// ── Konfiguráció ──────────────────────────────────────────────────────────────
-var baseDir = AppContext.BaseDirectory;
-var projectDir = Path.GetFullPath(Path.Combine(baseDir, @"..\..\..\"));
-var inputFile = args.Length > 0 ? args[0] : Path.Combine(projectDir, "bemenet.xlsx");
-var outputFile = args.Length > 1 ? args[1] : Path.Combine(projectDir, "eredmenyek.xlsx");
+// ── Fájlválasztó ablak ────────────────────────────────────────────────────────
+string? inputFile = null;
 
+if (OperatingSystem.IsWindows())
+    inputFile = ShowOpenFileDialog();
+else
+    inputFile = args.Length > 0 ? args[0] : "bemenet.xlsx";
+
+if (string.IsNullOrEmpty(inputFile))
+{
+    Console.WriteLine("Nem választottál fájlt. Kilépés.");
+    return 1;
+}
+
+var inputDir = Path.GetDirectoryName(inputFile) ?? ".";
+var inputName = Path.GetFileNameWithoutExtension(inputFile);
+var outputFile = Path.Combine(inputDir, $"{inputName}_eredmenyek.xlsx");
+
+// ── Konfiguráció ──────────────────────────────────────────────────────────────
 var config = new ScraperConfig
 {
-    Headless                = false,   // false = látható böngésző (debughoz)
-    SlowMo                  = 500,
-    DelayBetweenSearchesMs  = 1500,   // 1.5 mp keresések közt — szerver kímélése
-    NavigationTimeoutMs     = 30_000,
-    ElementTimeoutMs        = 10_000,
+    Headless = false,
+    SlowMo = 50,
+    DelayBetweenSearchesMs = 1500,
+    NavigationTimeoutMs = 30_000,
+    ElementTimeoutMs = 10_000,
 };
 
 // ── DI konténer ───────────────────────────────────────────────────────────────
 var services = new ServiceCollection()
-    .AddLogging(b => b
-        .AddConsole()
-        .SetMinimumLevel(LogLevel.Information))
+    .AddLogging(b => b.AddConsole().SetMinimumLevel(LogLevel.Information))
     .AddSingleton(config)
     .AddSingleton<ExcelService>()
     .AddSingleton<OenyScraperService>()
     .BuildServiceProvider();
 
-var logger      = services.GetRequiredService<ILogger<Program>>();
-var excel       = services.GetRequiredService<ExcelService>();
-var scraper     = services.GetRequiredService<OenyScraperService>();
+var logger = services.GetRequiredService<ILogger<Program>>();
+var excel = services.GetRequiredService<ExcelService>();
+var scraper = services.GetRequiredService<OenyScraperService>();
 
 // ── Fő folyamat ───────────────────────────────────────────────────────────────
 logger.LogInformation("OÉNY HRSZ Kereső indítása");
-logger.LogInformation("Bemenet : {Input}",  inputFile);
+logger.LogInformation("Bemenet : {Input}", inputFile);
 logger.LogInformation("Kimenet : {Output}", outputFile);
 
 try
 {
-    // 1. Excel beolvasás
     var rows = excel.ReadInput(inputFile);
     if (rows.Count == 0)
     {
@@ -46,38 +56,46 @@ try
         return 1;
     }
 
-    // 2. Playwright inicializálás
-    // Első futáskor: `playwright install chromium` szükséges!
     await scraper.InitAsync();
 
-    // 3. Keresések futtatása
-    var results = new List<SearchResult>();
+    var allResults = new List<SearchResult>();
     int idx = 0;
+
     foreach (var row in rows)
     {
         idx++;
         logger.LogInformation("[{Idx}/{Total}] {Varos} / {Hrsz}",
             idx, rows.Count, row.Varos, row.Hrsz);
 
-        var result = await scraper.SearchAsync(row);
-        results.Add(result);
+        // SearchAsync most listát ad vissza (több kártya = több sor)
+        var cardResults = await scraper.SearchAsync(row);
+        allResults.AddRange(cardResults);
 
-        if (result.Sikeres)
-            logger.LogInformation("  ✓ Cím: {Cim}  |  HRSZ: {Hrsz}", result.Cim, result.TalalaltHrsz);
+        int sikeresKartyak = cardResults.Count(r => r.Sikeres);
+        if (sikeresKartyak > 0)
+            logger.LogInformation("  ✓ {Count} találati kártya", sikeresKartyak);
         else
-            logger.LogWarning("  ✗ Hiba: {Hiba}", result.Hiba);
+            logger.LogWarning("  ✗ Hiba: {Hiba}", cardResults.FirstOrDefault()?.Hiba);
 
-        // Keresések közti szünet (szerver kímélése)
         if (idx < rows.Count)
             await Task.Delay(config.DelayBetweenSearchesMs);
     }
 
-    // 4. Eredmények kiírása
-    excel.WriteResults(outputFile, results);
+    excel.WriteResults(outputFile, allResults);
 
-    int sikeresDb = results.Count(r => r.Sikeres);
-    logger.LogInformation("Kész! {Ok}/{Total} sikeres keresés. Kimenet: {Output}",
-        sikeresDb, results.Count, outputFile);
+    int sikeresDb = allResults.Count(r => r.Sikeres);
+    logger.LogInformation("Kész! {Ok}/{Total} sikeres találat, {Rows} Excel sor. Kimenet: {Output}",
+        sikeresDb, allResults.Count, allResults.Count, outputFile);
+
+    // Eredményfájl automatikus megnyitása
+    if (OperatingSystem.IsWindows())
+    {
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = outputFile,
+            UseShellExecute = true
+        });
+    }
 
     return 0;
 }
@@ -89,4 +107,39 @@ catch (Exception ex)
 finally
 {
     await scraper.DisposeAsync();
+}
+
+// ── Windows fájlválasztó ablak ────────────────────────────────────────────────
+static string? ShowOpenFileDialog()
+{
+    try
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "powershell",
+            Arguments = "-NoProfile -Command \"" +
+                "Add-Type -AssemblyName System.Windows.Forms; " +
+                "$dlg = New-Object System.Windows.Forms.OpenFileDialog; " +
+                "$dlg.Title = 'Válaszd ki a bemeneti Excel fájlt'; " +
+                "$dlg.Filter = 'Excel fájlok (*.xlsx)|*.xlsx|Minden fájl (*.*)|*.*'; " +
+                "$dlg.FilterIndex = 1; " +
+                "if ($dlg.ShowDialog() -eq 'OK') { Write-Output $dlg.FileName } " +
+                "else { Write-Output '' }\"",
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using var process = System.Diagnostics.Process.Start(psi);
+        var result = process?.StandardOutput.ReadToEnd().Trim();
+        process?.WaitForExit();
+
+        return string.IsNullOrWhiteSpace(result) ? null : result;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Fájlválasztó hiba: {ex.Message}");
+        Console.Write("Add meg a fájl elérési útját kézzel: ");
+        return Console.ReadLine()?.Trim();
+    }
 }
